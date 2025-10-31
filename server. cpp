@@ -2,18 +2,14 @@
 #include <winsock2.h> 
 #include <windows.h> 
 #include <string> 
-#include <thread>
 #include <vector>
-#include <mutex>
 
 #pragma comment (lib, "Ws2_32.lib")  
 #define SRV_PORT 1234  
 #define BUF_SIZE 64  
+#define MAX_CLIENTS 100
 
 using namespace std;
-
-// Мьютекс для безопасного вывода в консоль из разных потоков
-mutex consoleMutex;
 
 struct Employee {
     char name[20];
@@ -21,6 +17,11 @@ struct Employee {
     int overtime_hours;
     int efficiency;
     int initiatives;
+};
+
+struct ClientInfo {
+    SOCKET socket;
+    int id;
 };
 
 const string greeting = "Сервер готов к расчету премий";
@@ -35,62 +36,54 @@ string calculateBonus(const Employee& emp) {
     else return "HIGH_BONUS";
 }
 
-// Функция для обработки отдельного клиента
-void handleClient(SOCKET clientSocket, int clientId) {
+// Функция потока для обработки клиента
+DWORD WINAPI ClientHandler(LPVOID lpParam) {
+    ClientInfo* clientInfo = (ClientInfo*)lpParam;
+    SOCKET clientSocket = clientInfo->socket;
+    int clientId = clientInfo->id;
+    
     char buf[BUF_SIZE] = { 0 };
     string msg = greeting;
 
-    try {
-        // Отправляем приветствие клиенту
-        {
-            lock_guard<mutex> lock(consoleMutex);
-            cout << "Клиент #" << clientId << " подключен. Отправляем приветствие." << endl;
+    // Освобождаем память структуры, так как она больше не нужна
+    delete clientInfo;
+
+    cout << "Клиент #" << clientId << " подключен. Обработка в отдельном потоке." << endl;
+
+    // Отправляем приветствие клиенту
+    int msgSize = static_cast<int>(msg.size());
+    send(clientSocket, (char*)&msg[0], msgSize, 0);
+
+    // Основной цикл обработки запросов от клиента
+    while (true) {
+        // Получаем данные сотрудника от клиента
+        int len = recv(clientSocket, buf, BUF_SIZE, 0);
+        
+        if (len == SOCKET_ERROR || len == 0) {
+            // Клиент отключился или ошибка
+            break;
         }
 
-        int msgSize = static_cast<int>(msg.size());
-        send(clientSocket, (char*)&msg[0], msgSize, 0);
+        Employee* emp = (Employee*)buf;
+        string bonusCode = calculateBonus(*emp);
 
-        // Основной цикл обработки запросов от клиента
-        while (true) {
-            // Получаем данные сотрудника от клиента
-            int len = recv(clientSocket, buf, BUF_SIZE, 0);
-            
-            if (len == SOCKET_ERROR || len == 0) {
-                // Клиент отключился или ошибка
-                break;
-            }
+        cout << "Клиент #" << clientId << " | Сотрудник " << emp->name 
+             << ": " << bonusCode << endl;
 
-            Employee* emp = (Employee*)buf;
-            string bonusCode = calculateBonus(*emp);
-
-            {
-                lock_guard<mutex> lock(consoleMutex);
-                cout << "Клиент #" << clientId << " | Сотрудник " << emp->name 
-                     << ": " << bonusCode << endl;
-            }
-
-            // Отправляем результат клиенту
-            int bonusSize = static_cast<int>(bonusCode.size());
-            send(clientSocket, (char*)&bonusCode[0], bonusSize, 0);
-        }
-    }
-    catch (const exception& e) {
-        lock_guard<mutex> lock(consoleMutex);
-        cout << "Ошибка при работе с клиентом #" << clientId << ": " << e.what() << endl;
+        // Отправляем результат клиенту
+        int bonusSize = static_cast<int>(bonusCode.size());
+        send(clientSocket, (char*)&bonusCode[0], bonusSize, 0);
     }
 
-    {
-        lock_guard<mutex> lock(consoleMutex);
-        cout << "Клиент #" << clientId << " отключен." << endl;
-    }
-    
+    cout << "Клиент #" << clientId << " отключен." << endl;
     closesocket(clientSocket);
+    return 0;
 }
 
 int main() {
     setlocale(LC_ALL, "rus");
-    cout << "\t Многопоточный сервер расчета премий\n";
-    cout << "\t (Поддерживает одновременную работу множества клиентов)\n";
+    cout << "\t Упрощенный многопоточный сервер расчета премий\n";
+    cout << "\t (Использует WinAPI потоки)\n";
     for (int i = 0; i < 50; i++)
         cout << "-";
     cout << endl;
@@ -114,7 +107,7 @@ int main() {
 
     // Настройка адреса сервера
     sin.sin_family = AF_INET;
-    sin.sin_addr.s_addr = INADDR_ANY;  // Принимать соединения с любых интерфейсов
+    sin.sin_addr.s_addr = INADDR_ANY;
     sin.sin_port = htons(SRV_PORT);
 
     // Привязка сокета к адресу
@@ -136,7 +129,7 @@ int main() {
     cout << "Сервер запущен на порту " << SRV_PORT << endl;
     cout << "Ожидание подключений..." << endl;
 
-    vector<thread> clientThreads;
+    vector<HANDLE> clientThreads;
     int clientCounter = 0;
 
     // Основной цикл принятия подключений
@@ -153,48 +146,49 @@ int main() {
         }
 
         clientCounter++;
-        
-        {
-            lock_guard<mutex> lock(consoleMutex);
-            cout << "Принято новое подключение. ID клиента: " << clientCounter << endl;
-            cout << "Активных клиентов: " << clientThreads.size() + 1 << endl;
-        }
+        cout << "Принято новое подключение. ID клиента: " << clientCounter << endl;
 
-        // Запуск отдельного потока для обработки клиента
-        thread clientThread(handleClient, clientSocket, clientCounter);
-        clientThreads.push_back(move(clientThread));
+        // Создаем структуру для передачи данных в поток
+        ClientInfo* clientInfo = new ClientInfo;
+        clientInfo->socket = clientSocket;
+        clientInfo->id = clientCounter;
 
-        // Очистка завершенных потоков
-        for (auto it = clientThreads.begin(); it != clientThreads.end(); ) {
-            if (it->joinable()) {
-                // Проверяем, завершился ли поток (неблокирующая проверка)
-                // В реальном приложении лучше использовать condition variables
-                try {
-                    if (it->try_join_for(chrono::milliseconds(0))) {
-                        it->join();
-                        it = clientThreads.erase(it);
-                        {
-                            lock_guard<mutex> lock(consoleMutex);
-                            cout << "Поток клиента завершен и удален. Активных клиентов: " 
-                                 << clientThreads.size() << endl;
-                        }
-                    } else {
-                        ++it;
-                    }
-                } catch (...) {
+        // Создаем поток для обработки клиента
+        HANDLE hThread = CreateThread(
+            NULL,                   // Безопасность по умолчанию
+            0,                      // Размер стека по умолчанию
+            ClientHandler,          // Функция потока
+            clientInfo,             // Параметры
+            0,                      // Флаги создания
+            NULL                    // ID потока не сохраняем
+        );
+
+        if (hThread == NULL) {
+            cout << "Ошибка создания потока! \n" << GetLastError();
+            delete clientInfo;
+            closesocket(clientSocket);
+        } else {
+            clientThreads.push_back(hThread);
+            
+            // Очистка завершенных потоков
+            for (auto it = clientThreads.begin(); it != clientThreads.end(); ) {
+                DWORD exitCode;
+                if (GetExitCodeThread(*it, &exitCode) && exitCode != STILL_ACTIVE) {
+                    CloseHandle(*it);
+                    it = clientThreads.erase(it);
+                    cout << "Поток клиента завершен. Активных потоков: " 
+                         << clientThreads.size() << endl;
+                } else {
                     ++it;
                 }
-            } else {
-                ++it;
             }
         }
     }
 
-    // Ожидание завершения всех потоков (на практике сюда не дойдет из-за бесконечного цикла)
-    for (auto& thread : clientThreads) {
-        if (thread.joinable()) {
-            thread.join();
-        }
+    // Закрытие handles потоков (на практике сюда не дойдет)
+    for (HANDLE hThread : clientThreads) {
+        WaitForSingleObject(hThread, INFINITE);
+        CloseHandle(hThread);
     }
 
     closesocket(sListener);

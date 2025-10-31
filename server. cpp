@@ -1,0 +1,203 @@
+#include <iostream>  
+#include <winsock2.h> 
+#include <windows.h> 
+#include <string> 
+#include <thread>
+#include <vector>
+#include <mutex>
+
+#pragma comment (lib, "Ws2_32.lib")  
+#define SRV_PORT 1234  
+#define BUF_SIZE 64  
+
+using namespace std;
+
+// Мьютекс для безопасного вывода в консоль из разных потоков
+mutex consoleMutex;
+
+struct Employee {
+    char name[20];
+    int projects_completed;
+    int overtime_hours;
+    int efficiency;
+    int initiatives;
+};
+
+const string greeting = "Сервер готов к расчету премий";
+
+string calculateBonus(const Employee& emp) {
+    int score = emp.projects_completed + emp.overtime_hours +
+        emp.efficiency + emp.initiatives;
+
+    if (score < 10) return "NO_BONUS";
+    else if (score >= 10 && score < 20) return "STANDARD_BONUS";
+    else if (score >= 20 && score < 30) return "MEDIUM_BONUS";
+    else return "HIGH_BONUS";
+}
+
+// Функция для обработки отдельного клиента
+void handleClient(SOCKET clientSocket, int clientId) {
+    char buf[BUF_SIZE] = { 0 };
+    string msg = greeting;
+
+    try {
+        // Отправляем приветствие клиенту
+        {
+            lock_guard<mutex> lock(consoleMutex);
+            cout << "Клиент #" << clientId << " подключен. Отправляем приветствие." << endl;
+        }
+
+        int msgSize = static_cast<int>(msg.size());
+        send(clientSocket, (char*)&msg[0], msgSize, 0);
+
+        // Основной цикл обработки запросов от клиента
+        while (true) {
+            // Получаем данные сотрудника от клиента
+            int len = recv(clientSocket, buf, BUF_SIZE, 0);
+            
+            if (len == SOCKET_ERROR || len == 0) {
+                // Клиент отключился или ошибка
+                break;
+            }
+
+            Employee* emp = (Employee*)buf;
+            string bonusCode = calculateBonus(*emp);
+
+            {
+                lock_guard<mutex> lock(consoleMutex);
+                cout << "Клиент #" << clientId << " | Сотрудник " << emp->name 
+                     << ": " << bonusCode << endl;
+            }
+
+            // Отправляем результат клиенту
+            int bonusSize = static_cast<int>(bonusCode.size());
+            send(clientSocket, (char*)&bonusCode[0], bonusSize, 0);
+        }
+    }
+    catch (const exception& e) {
+        lock_guard<mutex> lock(consoleMutex);
+        cout << "Ошибка при работе с клиентом #" << clientId << ": " << e.what() << endl;
+    }
+
+    {
+        lock_guard<mutex> lock(consoleMutex);
+        cout << "Клиент #" << clientId << " отключен." << endl;
+    }
+    
+    closesocket(clientSocket);
+}
+
+int main() {
+    setlocale(LC_ALL, "rus");
+    cout << "\t Многопоточный сервер расчета премий\n";
+    cout << "\t (Поддерживает одновременную работу множества клиентов)\n";
+    for (int i = 0; i < 50; i++)
+        cout << "-";
+    cout << endl;
+
+    char buff[1024];
+    if (WSAStartup(0x0202, (WSADATA*)&buff[0])) {
+        cout << "Ошибка инициализации Winsock! \n" << WSAGetLastError();
+        return -1;
+    }
+
+    SOCKET sListener;
+    sockaddr_in sin;
+
+    // Создание слушающего сокета
+    sListener = socket(AF_INET, SOCK_STREAM, 0);
+    if (sListener == INVALID_SOCKET) {
+        cout << "Ошибка создания сокета! \n" << WSAGetLastError();
+        WSACleanup();
+        return -1;
+    }
+
+    // Настройка адреса сервера
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = INADDR_ANY;  // Принимать соединения с любых интерфейсов
+    sin.sin_port = htons(SRV_PORT);
+
+    // Привязка сокета к адресу
+    if (bind(sListener, (sockaddr*)&sin, sizeof(sin)) == SOCKET_ERROR) {
+        cout << "Ошибка привязки сокета! \n" << WSAGetLastError();
+        closesocket(sListener);
+        WSACleanup();
+        return -1;
+    }
+
+    // Перевод сокета в режим прослушивания
+    if (listen(sListener, SOMAXCONN) == SOCKET_ERROR) {
+        cout << "Ошибка listen! \n" << WSAGetLastError();
+        closesocket(sListener);
+        WSACleanup();
+        return -1;
+    }
+
+    cout << "Сервер запущен на порту " << SRV_PORT << endl;
+    cout << "Ожидание подключений..." << endl;
+
+    vector<thread> clientThreads;
+    int clientCounter = 0;
+
+    // Основной цикл принятия подключений
+    while (true) {
+        sockaddr_in clntSin;
+        int clntLen = sizeof(clntSin);
+        
+        // Принятие входящего соединения
+        SOCKET clientSocket = accept(sListener, (sockaddr*)&clntSin, &clntLen);
+        
+        if (clientSocket == INVALID_SOCKET) {
+            cout << "Ошибка accept! \n" << WSAGetLastError();
+            continue;
+        }
+
+        clientCounter++;
+        
+        {
+            lock_guard<mutex> lock(consoleMutex);
+            cout << "Принято новое подключение. ID клиента: " << clientCounter << endl;
+            cout << "Активных клиентов: " << clientThreads.size() + 1 << endl;
+        }
+
+        // Запуск отдельного потока для обработки клиента
+        thread clientThread(handleClient, clientSocket, clientCounter);
+        clientThreads.push_back(move(clientThread));
+
+        // Очистка завершенных потоков
+        for (auto it = clientThreads.begin(); it != clientThreads.end(); ) {
+            if (it->joinable()) {
+                // Проверяем, завершился ли поток (неблокирующая проверка)
+                // В реальном приложении лучше использовать condition variables
+                try {
+                    if (it->try_join_for(chrono::milliseconds(0))) {
+                        it->join();
+                        it = clientThreads.erase(it);
+                        {
+                            lock_guard<mutex> lock(consoleMutex);
+                            cout << "Поток клиента завершен и удален. Активных клиентов: " 
+                                 << clientThreads.size() << endl;
+                        }
+                    } else {
+                        ++it;
+                    }
+                } catch (...) {
+                    ++it;
+                }
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Ожидание завершения всех потоков (на практике сюда не дойдет из-за бесконечного цикла)
+    for (auto& thread : clientThreads) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    closesocket(sListener);
+    WSACleanup();
+    return 0;
+}
